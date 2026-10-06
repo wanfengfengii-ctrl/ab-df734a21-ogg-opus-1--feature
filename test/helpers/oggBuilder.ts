@@ -131,6 +131,52 @@ export function opusHead(options: { channels?: 1 | 2; preSkip?: number } = {}): 
   return p;
 }
 
+/**
+ * Build a mapping-family-1 OpusHead (RFC 7845 5.1.1.2): the base 19
+ * bytes plus stream count, coupled count and one mapping octet per
+ * output channel.
+ */
+export function opusHeadFamily1(options: {
+  channels: number;
+  streamCount: number;
+  coupledCount: number;
+  mapping: number[];
+  preSkip?: number;
+}): Uint8Array {
+  if (options.mapping.length !== options.channels) {
+    throw new Error("mapping table must contain one octet per output channel");
+  }
+  const preSkip = options.preSkip ?? 312;
+  const p = new Uint8Array(21 + options.channels);
+  p.set(new TextEncoder().encode("OpusHead"), 0);
+  p[8] = 1; // version
+  p[9] = options.channels;
+  p[10] = preSkip & 0xff;
+  p[11] = (preSkip >> 8) & 0xff;
+  writeU32Le(p, 12, 48000);
+  // output gain 0 at 16..17
+  p[18] = 1; // mapping family
+  p[19] = options.streamCount;
+  p[20] = options.coupledCount;
+  p.set(Uint8Array.from(options.mapping), 21);
+  return p;
+}
+
+/** Standard family-1 declarations for 1..8 output channels (RFC 7845). */
+export const FAMILY1_STANDARD: Record<
+  number,
+  { streamCount: number; coupledCount: number; mapping: number[] }
+> = {
+  1: { streamCount: 1, coupledCount: 0, mapping: [0] },
+  2: { streamCount: 1, coupledCount: 1, mapping: [0, 1] },
+  3: { streamCount: 2, coupledCount: 1, mapping: [0, 1, 2] },
+  4: { streamCount: 2, coupledCount: 2, mapping: [0, 1, 2, 3] },
+  5: { streamCount: 3, coupledCount: 2, mapping: [0, 1, 2, 3, 4] },
+  6: { streamCount: 4, coupledCount: 2, mapping: [0, 1, 2, 3, 4, 5] },
+  7: { streamCount: 5, coupledCount: 2, mapping: [0, 1, 2, 3, 4, 5, 6] },
+  8: { streamCount: 5, coupledCount: 3, mapping: [0, 1, 2, 3, 4, 5, 6, 7] },
+};
+
 export function opusTags(vendor = "test-encoder", comments: [string, string][] = []): Uint8Array {
   const vendorBytes = new TextEncoder().encode(vendor);
   const parts: Uint8Array[] = [];
@@ -152,7 +198,9 @@ export function opusTags(vendor = "test-encoder", comments: [string, string][] =
 /**
  * Build an Opus audio packet from TOC fields (RFC 6716 section 3.1).
  * `frameData` is opaque compressed frame data; tests mostly care about
- * TOC-derived durations and structural validity.
+ * TOC-derived durations and structural validity. With `selfDelimiting`,
+ * the Appendix B framing used by non-final multistream substreams is
+ * emitted: an extra one-/two-byte frame length precedes the frame data.
  */
 export function opusPacket(options: {
   config?: number;
@@ -162,22 +210,36 @@ export function opusPacket(options: {
   frameCount?: number;
   vbr?: boolean;
   padding?: number;
+  selfDelimiting?: boolean;
 }): Uint8Array {
   const cfg = options.config ?? 28; // CELT FB 2.5 ms
   const stereo = options.stereo ?? false;
   const code = options.code ?? 0;
+  const selfDelimiting = options.selfDelimiting ?? false;
   const toc = ((cfg & 0x1f) << 3) | (stereo ? 0x04 : 0) | code;
   const frames = options.frameData ?? [new Uint8Array([0x00])];
   const parts: Uint8Array[] = [new Uint8Array([toc])];
 
   if (code === 0) {
+    if (selfDelimiting) {
+      parts.push(encodeLength(frames[0]!.length));
+    }
     parts.push(frames[0] ?? new Uint8Array(0));
   } else if (code === 1) {
     const f = frames[0]!;
+    if (selfDelimiting) {
+      parts.push(encodeLength(f.length));
+    }
     parts.push(f, f);
   } else if (code === 2) {
     const n1 = frames[0]!.length;
-    parts.push(encodeLength(n1), frames[0]!, frames[1] ?? new Uint8Array(0));
+    const n2 = (frames[1] ?? new Uint8Array(0)).length;
+    if (selfDelimiting) {
+      parts.push(encodeLength(n1), encodeLength(n2));
+    } else {
+      parts.push(encodeLength(n1));
+    }
+    parts.push(frames[0]!, frames[1] ?? new Uint8Array(0));
   } else {
     const m = options.frameCount ?? frames.length;
     const vbr = options.vbr ?? false;
@@ -191,25 +253,60 @@ export function opusPacket(options: {
       }
       parts.push(new Uint8Array([rest]));
     }
-    if (vbr) {
+    if (selfDelimiting) {
+      // Figures 28/29: every frame length precedes the frame run (all M
+      // of them for VBR; one shared length for CBR).
+      if (vbr) {
+        for (const f of frames) {
+          parts.push(encodeLength(f.length));
+        }
+      } else {
+        parts.push(encodeLength(frames[0]!.length));
+      }
+    } else if (vbr) {
       // All M-1 frame lengths precede the frame bytes (RFC 6716 Fig 7).
-      const lengths: Uint8Array[] = [];
       for (let i = 0; i < m - 1; i++) {
-        lengths.push(encodeLength(frames[i]!.length));
+        parts.push(encodeLength(frames[i]!.length));
       }
-      parts.push(...lengths);
-      for (const f of frames) {
-        parts.push(f);
-      }
-    } else {
-      for (const f of frames) {
-        parts.push(f);
-      }
+    }
+    for (const f of frames) {
+      parts.push(f);
     }
     if (padding > 0) {
       parts.push(new Uint8Array(padding));
     }
   }
+  return concat(parts);
+}
+
+export interface MultistreamSubpacket {
+  config?: number;
+  stereo?: boolean;
+  code?: 0 | 1 | 2 | 3;
+  frameData?: Uint8Array[];
+  frameCount?: number;
+  vbr?: boolean;
+  padding?: number;
+}
+
+/**
+ * Pack one multistream Ogg audio packet: the first (N-1) Opus substreams
+ * use Appendix B self-delimiting framing, the last uses ordinary framing
+ * (RFC 7845 section 3).
+ */
+export function multistreamPacket(subpackets: MultistreamSubpacket[]): Uint8Array {
+  if (subpackets.length === 0) {
+    throw new Error("multistream packet needs at least one substream");
+  }
+  const parts: Uint8Array[] = [];
+  subpackets.forEach((sub, i) => {
+    parts.push(
+      opusPacket({
+        ...sub,
+        selfDelimiting: i < subpackets.length - 1,
+      }),
+    );
+  });
   return concat(parts);
 }
 
@@ -436,6 +533,43 @@ function writeU32Le(data: Uint8Array, offset: number, value: number): void {
   data[offset + 1] = (value >>> 8) & 0xff;
   data[offset + 2] = (value >>> 16) & 0xff;
   data[offset + 3] = (value >>> 24) & 0xff;
+}
+
+/** Byte offset of page `wanted` within a concatenated Ogg stream. */
+export function findPageOffset(buf: Uint8Array, wanted: number): number {
+  let off = 0;
+  for (let idx = 0; idx < wanted; idx++) {
+    const nseg = buf[off + 26]!;
+    let bodyLen = 0;
+    for (let i = 0; i < nseg; i++) bodyLen += buf[off + 27 + i]!;
+    off += 27 + nseg + bodyLen;
+  }
+  return off;
+}
+
+/** Recompute the CRC of every page after a semantic mutation. */
+export function repairAllCrcs(buf: Uint8Array): Uint8Array {
+  let off = 0;
+  while (off < buf.length) {
+    const nseg = buf[off + 26]!;
+    let bodyLen = 0;
+    for (let i = 0; i < nseg; i++) bodyLen += buf[off + 27 + i]!;
+    const end = off + 27 + nseg + bodyLen;
+    for (let i = 0; i < 4; i++) buf[off + 22 + i] = 0;
+    const crc = oggCrc32(buf.subarray(off, end));
+    writeU32Le(buf, off + 22, crc);
+    off = end;
+  }
+  return buf;
+}
+
+/** Overwrite one page's 64-bit granule position (CRC must be repaired). */
+export function writePageGranule(buf: Uint8Array, pageStart: number, value: bigint): void {
+  let v = BigInt.asUintN(64, value);
+  for (let i = 0; i < 8; i++) {
+    buf[pageStart + 6 + i] = Number(v & 0xffn);
+    v >>= 8n;
+  }
 }
 
 function writeU64Le(data: Uint8Array, offset: number, value: bigint): void {

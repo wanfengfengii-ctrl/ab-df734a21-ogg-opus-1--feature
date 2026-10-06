@@ -8,8 +8,12 @@
 import {
   buildRawPage,
   FLAG_EOS,
+  lacePackets,
+  multistreamPacket,
   OggFileBuilder,
+  opusHeadFamily1,
   opusPacket,
+  FAMILY1_STANDARD,
 } from "../test/helpers/oggBuilder.ts";
 
 const BASE_URL = process.env.BASE_URL ?? "http://127.0.0.1:3000";
@@ -122,6 +126,77 @@ function granuleContradictionStream(): Uint8Array {
   return stream;
 }
 
+/* ----------------------------- family 1 helpers -------------------------- */
+
+function family1Spec(channels: number) {
+  return FAMILY1_STANDARD[channels]!;
+}
+
+function family1Packet(channels: number): Uint8Array {
+  const spec = family1Spec(channels);
+  return multistreamPacket([
+    ...Array.from({ length: spec.coupledCount }, () => ({
+      config: 31,
+      stereo: true,
+      frameData: [new Uint8Array([0x31])],
+    })),
+    ...Array.from({ length: spec.streamCount - spec.coupledCount }, () => ({
+      config: 31,
+      stereo: false,
+      frameData: [new Uint8Array([0x32])],
+    })),
+  ]);
+}
+
+/** Valid 5.1 (6-channel, four streams/two coupled) record, two packets/page. */
+function validFamily1Stream(): Uint8Array {
+  const spec = family1Spec(6);
+  const head = opusHeadFamily1({ channels: 6, ...spec, preSkip: 0 });
+  const packets = Array.from({ length: 4 }, () => family1Packet(6));
+  return new OggFileBuilder({ preSkip: 0 })
+    .writeHeaders({ head })
+    .writeAudioPackets(packets, { packetsPerPage: 2 })
+    .build();
+}
+
+/** OpusHead whose coupled count exceeds the stream count. */
+function invalidMappingStream(): Uint8Array {
+  const head = opusHeadFamily1({
+    channels: 3,
+    streamCount: 1,
+    coupledCount: 2,
+    mapping: [0, 1, 2],
+  });
+  return new OggFileBuilder().writeHeaders({ head }).build();
+}
+
+/** 5.1 packet rebuilt with its final substream cut off at the Ogg edge. */
+function truncatedSubstreamRecord(): Uint8Array {
+  const head = opusHeadFamily1({ channels: 6, ...family1Spec(6), preSkip: 0 });
+  const cut = family1Packet(6).subarray(0, family1Packet(6).length - 2);
+  const lacing = lacePackets([cut]);
+  return new OggFileBuilder({ preSkip: 0 })
+    .writeHeaders({ head })
+    .writeRawPages([
+      { flags: FLAG_EOS, granule: 960n, segments: lacing.segments, body: lacing.body },
+    ])
+    .build();
+}
+
+/** 3-channel record whose two substreams decode different durations. */
+function substreamDurationRecord(): Uint8Array {
+  const spec = family1Spec(3);
+  const head = opusHeadFamily1({ channels: 3, ...spec, preSkip: 0 });
+  const packet = multistreamPacket([
+    { config: 31, stereo: true, frameData: [new Uint8Array([1])] }, // 960
+    { config: 28, stereo: false, frameData: [new Uint8Array([2])] }, // 120
+  ]);
+  return new OggFileBuilder({ preSkip: 0 })
+    .writeHeaders({ head })
+    .writeAudioPackets([packet])
+    .build();
+}
+
 function pageOffset(buf: Uint8Array, wanted: number): number {
   let off = 0;
   for (let idx = 0; idx < wanted; idx++) {
@@ -215,7 +290,47 @@ async function main(): Promise<void> {
   );
   check("failure page is 3", contradiction.json?.error?.page === 3, JSON.stringify(contradiction.json));
 
-  console.log("6. transport-level rejection");
+  console.log("6. valid family 1 multichannel (5.1) record");
+  const multi = validFamily1Stream();
+  const r7 = await postAudit(multi);
+  check("returns 200", r7.status === 200, `status=${r7.status} ${JSON.stringify(r7.json)}`);
+  check("four pages (head, tags, 2 audio)", r7.json?.pageCount === 4, JSON.stringify(r7.json));
+  check("four Ogg audio packets", r7.json?.audioPacketCount === 4, JSON.stringify(r7.json));
+  check("duration counted once per packet", r7.json?.decodedSamples === 4 * 960, JSON.stringify(r7.json));
+  const r7b = await postAudit(multi);
+  check("statistics are stable", JSON.stringify(r7b.json) === JSON.stringify(r7.json));
+
+  console.log("7. family 1 illegal channel mapping is rejected");
+  const badMap = await postAudit(invalidMappingStream());
+  check("returns 422", badMap.status === 422, `status=${badMap.status}`);
+  check(
+    "stable error code CHANNEL_MAPPING_INVALID",
+    badMap.json?.error?.code === "CHANNEL_MAPPING_INVALID",
+    JSON.stringify(badMap.json),
+  );
+  check("failure page is 0", badMap.json?.error?.page === 0, JSON.stringify(badMap.json));
+
+  console.log("8. family 1 truncated substream is rejected");
+  const cutStream = await postAudit(truncatedSubstreamRecord());
+  check("returns 422", cutStream.status === 422, `status=${cutStream.status}`);
+  check(
+    "stable error code SUBSTREAM_TRUNCATED",
+    cutStream.json?.error?.code === "SUBSTREAM_TRUNCATED",
+    JSON.stringify(cutStream.json),
+  );
+  check("failure page is 2", cutStream.json?.error?.page === 2, JSON.stringify(cutStream.json));
+
+  console.log("9. family 1 substream duration mismatch is rejected");
+  const dur = await postAudit(substreamDurationRecord());
+  check("returns 422", dur.status === 422, `status=${dur.status}`);
+  check(
+    "stable error code SUBSTREAM_DURATION_MISMATCH",
+    dur.json?.error?.code === "SUBSTREAM_DURATION_MISMATCH",
+    JSON.stringify(dur.json),
+  );
+  check("failure page is 2", dur.json?.error?.page === 2, JSON.stringify(dur.json));
+
+  console.log("10. transport-level rejection");
   const wrongType = await postAudit(good, "application/octet-stream");
   check("non audio/ogg payload is 415", wrongType.status === 415, `status=${wrongType.status}`);
 

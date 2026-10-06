@@ -372,12 +372,22 @@ test("OpusHead with zero channels fails", () => {
   expectFail(file, "ID_HEADER_INVALID", 0);
 });
 
-test("nonzero channel mapping family fails", () => {
+test("family 1 OpusHead without a mapping table fails as invalid", () => {
   const head = opusHead();
   head[18] = 1;
   const file = new OggFileBuilder().writeHeaders({ head }).build();
   fixCrcs(file);
-  expectFail(file, "CHANNEL_MAPPING_UNSUPPORTED", 0);
+  expectFail(file, "CHANNEL_MAPPING_INVALID", 0);
+});
+
+test("reserved/unknown channel mapping families fail", () => {
+  for (const family of [2, 254, 255]) {
+    const head = opusHead();
+    head[18] = family;
+    const file = new OggFileBuilder().writeHeaders({ head }).build();
+    fixCrcs(file);
+    expectFail(file, "CHANNEL_MAPPING_UNSUPPORTED", 0);
+  }
 });
 
 test("OpusTags with trailing bytes fails", () => {
