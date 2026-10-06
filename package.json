@@ -1,0 +1,21 @@
+{
+  "name": "opus-archive-audit",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ogg Opus archive integrity audit service for ocean acoustic station records",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node dist/src/main.js",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "smoke": "node scripts/smoke.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

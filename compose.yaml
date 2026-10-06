@@ -1,0 +1,38 @@
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    image: opus-archive-audit:latest
+    environment:
+      PORT: 3000
+      HOST: 0.0.0.0
+    ports:
+      # Host-side port is configurable via HOST_PORT (defaults to 3000).
+      - "${HOST_PORT:-3000}:3000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+
+  # One-shot verification gate. Starts only after the API health check
+  # passes; its container exit code summarizes type-check, unit tests,
+  # production build and the cross-page HTTP smoke test.
+  verify:
+    build:
+      context: .
+      target: verify
+    image: opus-archive-audit-verify:latest
+    environment:
+      BASE_URL: http://api:3000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
