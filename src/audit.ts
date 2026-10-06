@@ -11,7 +11,13 @@
  */
 
 import { oggCrc32 } from "./crc32ogg.ts";
-import { inspectOpusPacket, OpusFormatError } from "./opusToc.ts";
+import {
+  inspectOpusPacket,
+  inspectSelfDelimitedOpusPacket,
+  OpusFormatError,
+  type OpusPacketInfo,
+  OpusTruncationError,
+} from "./opusToc.ts";
 
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;
 export const MAX_PAGES = 2048;
@@ -43,11 +49,15 @@ export type AuditErrorCode =
   | "CONTINUATION_FLAG_INVALID"
   | "ID_HEADER_INVALID"
   | "CHANNEL_MAPPING_UNSUPPORTED"
+  | "CHANNEL_MAPPING_INVALID"
   | "COMMENT_HEADER_INVALID"
   | "HEADER_GRANULE_INVALID"
   | "AUDIO_PACKET_TRUNCATED"
   | "OPUS_PACKET_INVALID"
+  | "MULTISTREAM_PACKET_INVALID"
+  | "SUBSTREAM_TRUNCATED"
   | "CHANNEL_CONFIG_MISMATCH"
+  | "SUBSTREAM_DURATION_MISMATCH"
   | "GRANULE_SPAN_INVALID"
   | "GRANULE_MISSING"
   | "GRANULE_MISMATCH"
@@ -178,9 +188,37 @@ function parsePage(buf: Uint8Array, start: number, index: number): ParsedPage {
   return { index, headerType, granule, serial, sequence, segments, body, pageStart: start, pageEnd };
 }
 
+/**
+ * Canonical channel mapping family 1 layout for 1..8 channels
+ * (RFC 7845 5.1.1.2): total streams N, coupled streams M, and the
+ * Vorbis-order mapping indices. C=1/2 collapse to one stream exactly
+ * like family 0; the surround layouts start at C=3.
+ */
+interface Family1Layout {
+  streams: number;
+  coupled: number;
+  mapping: readonly number[];
+}
+
+const FAMILY_1_LAYOUTS: Readonly<Record<number, Family1Layout>> = {
+  1: { streams: 1, coupled: 0, mapping: [0] },
+  2: { streams: 1, coupled: 1, mapping: [0, 1] },
+  3: { streams: 2, coupled: 1, mapping: [0, 1, 2] },
+  4: { streams: 2, coupled: 2, mapping: [0, 1, 2, 3] },
+  5: { streams: 3, coupled: 2, mapping: [0, 1, 2, 3, 4] },
+  6: { streams: 4, coupled: 2, mapping: [0, 1, 2, 3, 4, 5] },
+  7: { streams: 5, coupled: 2, mapping: [0, 1, 2, 3, 4, 5, 6] },
+  8: { streams: 5, coupled: 3, mapping: [0, 1, 2, 3, 4, 5, 6, 7] },
+};
+
 interface IdHeader {
   channels: number;
   preSkip: number;
+  mappingFamily: 0 | 1;
+  /** Total packed Opus substreams per audio Ogg packet. */
+  streamCount: number;
+  /** Substreams configured stereo (the first `coupledStreamCount`). */
+  coupledStreamCount: number;
 }
 
 function validateIdHeader(packet: Uint8Array, pageIndex: number): IdHeader {
@@ -204,23 +242,101 @@ function validateIdHeader(packet: Uint8Array, pageIndex: number): IdHeader {
   }
   const preSkip = packet[10]! | (packet[11]! << 8);
   const mappingFamily = packet[18]!;
-  if (mappingFamily !== 0) {
-    // Family 1 multistream uses self-delimiting framing and packs
-    // multiple Opus packets per Ogg packet; this auditor handles only
-    // one Opus stream per logical stream.
-    fail(
-      "CHANNEL_MAPPING_UNSUPPORTED",
-      pageIndex,
-      `channel mapping family ${mappingFamily} is not supported`,
-    );
+
+  if (mappingFamily === 0) {
+    if (channels > 2) {
+      fail("ID_HEADER_INVALID", pageIndex, "mapping family 0 allows at most 2 channels");
+    }
+    if (packet.length !== 19) {
+      fail("ID_HEADER_INVALID", pageIndex, "family 0 OpusHead must be exactly 19 bytes");
+    }
+    return {
+      channels,
+      preSkip,
+      mappingFamily: 0,
+      streamCount: 1,
+      coupledStreamCount: channels - 1,
+    };
   }
-  if (channels > 2) {
-    fail("ID_HEADER_INVALID", pageIndex, "mapping family 0 allows at most 2 channels");
+
+  if (mappingFamily === 1) {
+    if (channels < 1 || channels > 8) {
+      fail(
+        "CHANNEL_MAPPING_INVALID",
+        pageIndex,
+        "mapping family 1 records carry 1 to 8 channels",
+      );
+    }
+    // RFC 7845 5.1: streams (19), coupled streams (20), then C mapping octets.
+    const expectedLength = 21 + channels;
+    if (packet.length < expectedLength) {
+      fail(
+        "CHANNEL_MAPPING_INVALID",
+        pageIndex,
+        "family 1 OpusHead too short for stream count, coupled count and mapping table",
+      );
+    }
+    if (packet.length > expectedLength) {
+      fail(
+        "CHANNEL_MAPPING_INVALID",
+        pageIndex,
+        "trailing bytes after the family 1 channel mapping table",
+      );
+    }
+    const streamCount = packet[19]!;
+    const coupledStreamCount = packet[20]!;
+    if (streamCount === 0) {
+      fail("CHANNEL_MAPPING_INVALID", pageIndex, "family 1 stream count must not be zero");
+    }
+    if (coupledStreamCount > streamCount) {
+      fail(
+        "CHANNEL_MAPPING_INVALID",
+        pageIndex,
+        "coupled stream count must not exceed the total stream count",
+      );
+    }
+    if (streamCount + coupledStreamCount > channels) {
+      fail(
+        "CHANNEL_MAPPING_INVALID",
+        pageIndex,
+        "decoded channel count (streams + coupled) exceeds the output channel count",
+      );
+    }
+
+    const layout = FAMILY_1_LAYOUTS[channels];
+    if (
+      layout === undefined ||
+      streamCount !== layout.streams ||
+      coupledStreamCount !== layout.coupled
+    ) {
+      fail(
+        "CHANNEL_MAPPING_INVALID",
+        pageIndex,
+        `family 1 ${channels}-channel header must declare ${layout?.streams ?? "?"} streams with ${
+          layout?.coupled ?? "?"
+        } coupled`,
+      );
+    }
+
+    const mapping = Array.from(packet.subarray(21, 21 + channels));
+    for (let i = 0; i < mapping.length; i++) {
+      if (mapping[i] !== layout.mapping[i]) {
+        fail(
+          "CHANNEL_MAPPING_INVALID",
+          pageIndex,
+          `family 1 ${channels}-channel mapping table must be the canonical Vorbis layout`,
+        );
+      }
+    }
+
+    return { channels, preSkip, mappingFamily: 1, streamCount, coupledStreamCount };
   }
-  if (packet.length !== 19) {
-    fail("ID_HEADER_INVALID", pageIndex, "family 0 OpusHead must be exactly 19 bytes");
-  }
-  return { channels, preSkip };
+
+  fail(
+    "CHANNEL_MAPPING_UNSUPPORTED",
+    pageIndex,
+    `channel mapping family ${mappingFamily} is not supported`,
+  );
 }
 
 function validateCommentHeader(packet: Uint8Array, pageIndex: number): void {
@@ -308,6 +424,117 @@ function walkPageSegments(
   return { completed, openChunks: chunks };
 }
 
+/**
+ * Validate one audio Ogg packet against the OpusHead layout and return
+ * its 48 kHz duration (counted once per Ogg packet, never per
+ * substream).
+ *
+ * Mapping family 0 packets carry one regular Opus packet. Mapping
+ * family 1 packets pack N Opus substreams (RFC 7845 3): the first N-1
+ * use RFC 6716 Appendix B self-delimiting framing, the last one uses
+ * regular framing. Every substream must be present with intact bounds;
+ * the first M are stereo and the rest mono; and all of them must decode
+ * the same number of samples (they share one packet duration).
+ */
+function inspectAudioPacket(
+  packet: Uint8Array,
+  id: IdHeader,
+  pageIndex: number,
+): number {
+  if (packet.length === 0) {
+    fail("OPUS_PACKET_INVALID", pageIndex, "zero-octet audio packet");
+  }
+
+  if (id.mappingFamily === 0) {
+    let info;
+    try {
+      info = inspectOpusPacket(packet);
+    } catch (err) {
+      if (err instanceof OpusFormatError) {
+        fail("OPUS_PACKET_INVALID", pageIndex, `malformed Opus packet: ${err.message}`);
+      }
+      throw err;
+    }
+    if (info.stereo !== (id.coupledStreamCount === 1)) {
+      fail(
+        "CHANNEL_CONFIG_MISMATCH",
+        pageIndex,
+        "audio packet stereo flag does not match the OpusHead channel count",
+      );
+    }
+    return info.totalSamples;
+  }
+
+  // --- mapping family 1 multistream packet ---
+  const n = id.streamCount;
+  const m = id.coupledStreamCount;
+  let cursor = 0;
+  let expectedSamples: number | null = null;
+
+  const reportFraming = (err: unknown, pageIndex: number, substream: number): never => {
+    if (err instanceof OpusTruncationError) {
+      fail(
+        "SUBSTREAM_TRUNCATED",
+        pageIndex,
+        `multichannel substream ${substream} is missing or its bounds are incomplete: ${err.message}`,
+      );
+    }
+    if (err instanceof OpusFormatError) {
+      fail(
+        "MULTISTREAM_PACKET_INVALID",
+        pageIndex,
+        `malformed multichannel substream ${substream}: ${err.message}`,
+      );
+    }
+    throw err;
+  };
+
+  for (let s = 0; s < n; s++) {
+    const wantStereo = s < m;
+    let info!: OpusPacketInfo;
+    if (s < n - 1) {
+      // All but the last substream use self-delimiting framing.
+      try {
+        const result = inspectSelfDelimitedOpusPacket(packet, cursor);
+        info = result.info;
+        cursor = result.next;
+      } catch (err) {
+        reportFraming(err, pageIndex, s);
+      }
+    } else {
+      // The final substream uses regular framing and, per RFC 7845 3,
+      // consumes every remaining byte of the Ogg packet.
+      if (cursor >= packet.length) {
+        fail("SUBSTREAM_TRUNCATED", pageIndex, `multichannel packet ends before substream ${s}`);
+      }
+      try {
+        info = inspectOpusPacket(packet.subarray(cursor));
+      } catch (err) {
+        reportFraming(err, pageIndex, s);
+      }
+    }
+
+    if (info.stereo !== wantStereo) {
+      fail(
+        "CHANNEL_CONFIG_MISMATCH",
+        pageIndex,
+        `substream ${s} stereo flag does not match the coupled/uncoupled stream layout`,
+      );
+    }
+    if (expectedSamples === null) {
+      expectedSamples = info.totalSamples;
+    } else if (info.totalSamples !== expectedSamples) {
+      fail(
+        "SUBSTREAM_DURATION_MISMATCH",
+        pageIndex,
+        `substream ${s} decodes ${info.totalSamples} samples but earlier substreams decode ${expectedSamples}`,
+      );
+    }
+  }
+
+  return expectedSamples ?? 0;
+}
+
 export function auditOggOpus(input: Uint8Array): AuditResult {
   if (input.length === 0) {
     fail("EMPTY_INPUT", null, "request body is empty", 400);
@@ -322,8 +549,6 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
   let serial: number | null = null;
   let expectedSequence = 0;
   let sawEos = false;
-  let channels = 0;
-  let preSkip = 0;
 
   let openChunks: Uint8Array[] | null = null;
   let previousEndedOpen = false;
@@ -331,6 +556,13 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
   let decodedSamples = 0;
   let audioPacketCount = 0;
   let lastAudioGranule: number | null = null;
+  let id: IdHeader = {
+    channels: 0,
+    preSkip: 0,
+    mappingFamily: 0,
+    streamCount: 1,
+    coupledStreamCount: 0,
+  };
 
   while (offset < input.length) {
     const index = pageCount;
@@ -405,9 +637,12 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
       if (page.granule !== 0) {
         fail("HEADER_GRANULE_INVALID", index, "ID header page granule must be zero");
       }
-      const id = validateIdHeader(completed[0]!, index);
-      channels = id.channels;
-      preSkip = id.preSkip;
+      const parsedId = validateIdHeader(completed[0]!, index);
+      id.channels = parsedId.channels;
+      id.preSkip = parsedId.preSkip;
+      id.mappingFamily = parsedId.mappingFamily;
+      id.streamCount = parsedId.streamCount;
+      id.coupledStreamCount = parsedId.coupledStreamCount;
       phase = "tags";
     } else if (phase === "tags") {
       if (eosFlag) {
@@ -466,26 +701,9 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
       } else {
         let pageSamples = 0;
         for (const packet of completed) {
-          if (packet.length === 0) {
-            fail("OPUS_PACKET_INVALID", index, "zero-octet audio packet");
-          }
-          let info;
-          try {
-            info = inspectOpusPacket(packet);
-          } catch (err) {
-            if (err instanceof OpusFormatError) {
-              fail("OPUS_PACKET_INVALID", index, `malformed Opus packet: ${err.message}`);
-            }
-            throw err;
-          }
-          if (info.stereo !== (channels === 2)) {
-            fail(
-              "CHANNEL_CONFIG_MISMATCH",
-              index,
-              "audio packet stereo flag does not match the OpusHead channel count",
-            );
-          }
-          pageSamples += info.totalSamples;
+          // Each Ogg audio packet contributes its duration once even
+          // though a family 1 packet holds several Opus substreams.
+          pageSamples += inspectAudioPacket(packet, id, index);
         }
 
         if (page.granule === GRANULE_UNSET) {
@@ -513,7 +731,7 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
               "EOS granule exceeds the samples completed on the final page",
             );
           }
-          if (lastAudioGranule === null && page.granule < preSkip) {
+          if (lastAudioGranule === null && page.granule < id.preSkip) {
             fail(
               "EOS_GRANULE_INVALID",
               index,
@@ -573,7 +791,7 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
   }
 
   const finalGranule = lastAudioGranule ?? 0;
-  const playableSamples = Math.max(0, finalGranule - preSkip);
+  const playableSamples = Math.max(0, finalGranule - id.preSkip);
 
   return {
     pageCount,

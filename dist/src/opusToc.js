@@ -49,6 +49,14 @@ function parseFrameLength(data, pos, available) {
 export class OpusFormatError extends Error {
 }
 /**
+ * A self-delimited substream whose declared bytes run past what the Ogg
+ * packet provides (or that is missing outright). Subclass of
+ * OpusFormatError so callers can treat a missing substream as a
+ * truncation rather than a framing contradiction.
+ */
+export class OpusTruncationError extends OpusFormatError {
+}
+/**
  * Validate an Opus packet's internal framing and return its 48 kHz
  * sample count. Mirrors the structural checks of opus_packet_parse_impl
  * (RFC 6716 3.2, rules R1..R7).
@@ -198,4 +206,124 @@ export function inspectOpusPacket(packet) {
         samplesPerFrame,
         totalSamples: samplesPerFrame * frameCount,
     };
+}
+export function inspectSelfDelimitedOpusPacket(data, start) {
+    if (start >= data.length) {
+        throw new OpusTruncationError("missing self-delimited opus packet");
+    }
+    const toc = data[start];
+    const code = toc & 0x03;
+    // Byte range occupied by the length field added by Appendix B. The
+    // regular-framing equivalent is the packet with that range removed.
+    let delimStart = start + 1;
+    let delimEnd;
+    let subEnd;
+    const readLen = (pos, what) => {
+        try {
+            const parsed = parseFrameLength(data, pos, data.length - pos);
+            return { length: parsed.length, next: pos + parsed.bytes };
+        }
+        catch (err) {
+            if (err instanceof OpusFormatError) {
+                throw new OpusTruncationError(`self-delimited packet: truncated ${what} length`);
+            }
+            throw err;
+        }
+    };
+    switch (code) {
+        case 0: {
+            // [TOC][N1][frame 1 (N1)]
+            const n1 = readLen(start + 1, "frame");
+            delimEnd = n1.next;
+            subEnd = delimEnd + n1.length;
+            break;
+        }
+        case 1: {
+            // [TOC][N1][frame 1][frame 2], each N1 bytes
+            const n1 = readLen(start + 1, "frame");
+            delimEnd = n1.next;
+            subEnd = delimEnd + 2 * n1.length;
+            break;
+        }
+        case 2: {
+            // [TOC][N1 (regular)][N2 (delimited)][frame 1][frame 2]
+            const n1 = readLen(start + 1, "first frame");
+            const n2 = readLen(n1.next, "second frame");
+            delimStart = n1.next;
+            delimEnd = n2.next;
+            subEnd = delimEnd + n1.length + n2.length;
+            break;
+        }
+        default: {
+            // Code 3: [TOC][ch][padding length ...][(frame lengths)][frames][padding data]
+            if (start + 1 >= data.length) {
+                throw new OpusTruncationError("self-delimited code 3 packet missing frame count byte");
+            }
+            const ch = data[start + 1];
+            const frameCount = ch & 0x3f;
+            const hasPadding = (ch & 0x40) !== 0;
+            const vbr = (ch & 0x80) !== 0;
+            if (frameCount === 0) {
+                throw new OpusFormatError("self-delimited code 3 packet with zero frames");
+            }
+            let pos = start + 2;
+            let paddingBytes = 0;
+            if (hasPadding) {
+                let p;
+                do {
+                    if (pos >= data.length) {
+                        throw new OpusTruncationError("self-delimited truncated opus padding length");
+                    }
+                    p = data[pos];
+                    pos += 1;
+                    paddingBytes += p === 255 ? 254 : p;
+                } while (p === 255);
+            }
+            if (vbr) {
+                // Regular framing carries N1..N[M-1]; Appendix B appends N[M].
+                let frameBytes = 0;
+                for (let i = 0; i < frameCount - 1; i++) {
+                    const n = readLen(pos, "vbr frame");
+                    pos = n.next;
+                    frameBytes += n.length;
+                }
+                const last = readLen(pos, "last vbr frame");
+                delimStart = pos;
+                delimEnd = last.next;
+                frameBytes += last.length;
+                subEnd = delimEnd + frameBytes + paddingBytes;
+            }
+            else {
+                // Appendix B inserts the single CBR frame length here.
+                delimStart = pos;
+                const nAll = readLen(pos, "cbr frame");
+                delimEnd = nAll.next;
+                subEnd = delimEnd + frameCount * nAll.length + paddingBytes;
+            }
+            break;
+        }
+    }
+    if (subEnd > data.length) {
+        throw new OpusTruncationError("self-delimited opus substream runs past the Ogg packet");
+    }
+    // Rebuild the regular (undelimited) packet so the full RFC 6716
+    // section 3.2 R1..R7 validation runs unchanged.
+    const regular = concatPacketBytes([
+        data.subarray(start, delimStart),
+        data.subarray(delimEnd, subEnd),
+    ]);
+    const info = inspectOpusPacket(regular);
+    return { info, next: subEnd };
+}
+function concatPacketBytes(parts) {
+    let total = 0;
+    for (const p of parts)
+        total += p.length;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) {
+        out.set(p, off);
+        off += p.length;
+    }
+    return out;
 }
